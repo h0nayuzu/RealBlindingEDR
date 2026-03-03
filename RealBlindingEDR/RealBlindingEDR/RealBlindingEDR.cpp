@@ -6,6 +6,11 @@ DWORD dwMinorVersion = 0;
 DWORD dwBuild = 0;
 INT64 EDRIntance[500] = { 0 };
 TCHAR* RandomName = NULL;
+
+// Forward declarations (defined later in file, used inside InitialDriver)
+BOOL GpuzReadPhys(DWORD64 physAddr, VOID* outBuf, DWORD size);
+VOID GpuzWritePhys(DWORD64 physAddr, VOID* inBuf, DWORD size);
+DWORD64 GpuzVirtToPhys(DWORD64 virtAddr);
 BOOL LoadDriver() {
 	HKEY hKey;
 	HKEY hsubkey;
